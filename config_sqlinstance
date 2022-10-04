@@ -1,0 +1,205 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+
+Import-Module -Name SqlServer
+
+
+function ConfigureSQLPorts()
+
+{
+
+    Param
+    
+    (
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$SQLInstance,
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$Instance_Id,
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$Port
+
+    )
+
+$MachineObject = new-object ('Microsoft.SqlServer.Management.Smo.WMI.ManagedComputer')
+
+$ProtocolUri = "ManagedComputer[@Name='" + (get-item env:computername).Value + "']/ServerInstance[@Name='$Instance_Id']/ServerProtocol"
+
+$tcp = $MachineObject.getsmoobject($ProtocolUri + "[@Name='Tcp']")
+
+$np = $MachineObject.getsmoobject($ProtocolUri + "[@Name='Np']")
+
+$sm = $MachineObject.getsmoobject($ProtocolUri + "[@Name='Sm']")
+
+$np.IsEnabled = $true
+
+$np.alter()
+
+$tcp.IsEnabled = $true
+
+$tcp.alter()
+
+$sm.IsEnabled=$true
+$sm.alter()
+
+$MachineObject.getsmoobject($tcp.urn.Value + "/IPAddress[@Name='IPAll']").IPAddressProperties[1].Value = "$Port"
+
+$tcp.alter()
+
+
+}
+
+function ConfigSQLServices()
+
+{  
+    Param
+    
+    (
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$SQLInstance,
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$Instance_Id
+
+    )     
+Write-Host "Configure SQL Server & SQL Agent Service Fault Tolerance Properties"
+$ServiceName="MSSQL`$$Instance_Id"
+[string] $action1 = "restart"
+[int] $time1 =  100000         
+[string] $action2 = "restart"
+[int] $time2 =  100000 
+[string] $actionLast = "restart"
+[int] $resetCounter = 86400 
+sc.exe config $ServiceName start= delayed-auto
+   $action = $action1+"/"+$time1+"/"+$action2+"/"+$time2
+sc.exe  failure $ServiceName actions= $action reset= $resetCounter
+
+$ServiceName="SQLAgent`$$Instance_Id"
+[string] $action1 = "restart"
+[int] $time1 =  200000         
+[string] $action2 = "restart"
+[int] $time2 =  200000 
+[string] $actionLast = "restart"
+[int] $resetCounter = 86400 
+sc.exe config $ServiceName start= delayed-auto
+   $action = $action1+"/"+$time1+"/"+$action2+"/"+$time2
+sc.exe  failure $ServiceName actions= $action reset= $resetCounter
+
+}
+
+function Optimize-TempDBSize
+
+{
+    Param
+    (
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$SQLInstance,
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][string]$Instance_Id,
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)][int]$SQLInstance_Count
+
+    )
+    
+               
+        $TempDB_FIlePath="Z:\"+$Instance_Id+"\MSSQL\TempDB\"
+        
+        New-Item -ItemType Directory -Path $TempDB_FIlePath -Force -ErrorAction Stop |Out-Null      
+    
+        $property = 'NumberOfLogicalProcessors'
+    
+        $NumberOfLogicalProcessors=Get-WmiObject -class win32_processor -Property  NumberOfLogicalProcessors |Select-Object -ExpandProperty NumberOfLogicalProcessors 
+    
+        Write-Host "Total Number Of Logical Processsors : $NumberOfLogicalProcessors" 
+    
+        $tempSize=Get-WmiObject -class win32_logicaldisk|Where-Object {$_.DeviceID -eq 'Z:'}|Select-Object -ExpandProperty Size
+    
+        $DiskSize=[math]::round($tempSize/1GB)
+    
+        Write-Host "Total Disk Space Available In GB On Z Drive : $DiskSize" 
+    
+        [bigint]$TagetDiskSizeUsage=0.9*$DiskSize
+    
+        $TagetDiskSizeUsage=$TagetDiskSizeUsage/$SQLInstance_Count
+    
+        Write-Host "Disk Space available for TempDB Use for the SQL Instance $SQLInstance : $TagetDiskSizeUsage" 
+
+        [int]$NoOfDataFiles=0
+        [int]$DataFileSize=0
+    
+        if($NumberOfLogicalProcessors -lt 4)
+        
+            {
+        
+                $NoOfDataFiles=4
+                
+                $DataFileSize=$TagetDiskSizeUsage/$NoOfDataFiles
+                }
+    
+    else
+        {
+        $NoOfDataFiles=8
+        $DataFileSize=$TagetDiskSizeUsage/$NoOfDataFiles       
+    }
+    #if($NumberOfLogicalProcessors -ge 8 )
+    #{
+       # $NoOfDataFiles=16
+       # $DataFileSize=$TagetDiskSizeUsage/$NoOfDataFiles
+        
+    #}
+    Write-Host "Total Number of TempDB Data Files to be Created : $NoOfDataFiles" 
+    Write-Host "Size of each TempDB Data File : $DataFileSize" 
+    $FIleSize=$DataFileSize.ToString()
+    $FIleSize=$FIleSize+'GB'
+    $query_TempDBFile="select name,physical_name,size/128 as Size_In_MB from sys.master_files where type=0 and database_id=db_id('tempdb')"
+    $result_TempDBFile=Invoke-Sqlcmd -ServerInstance $SQLInstance -Database master -Query $query_TempDBFile
+    $Optimize_TempDBSize=""
+    foreach($tempdbFile in $result_TempDBFile)
+        {
+               $Name=$tempdbFile.Name
+               $tempDB_Query="
+               USE master
+               
+               ALTER DATABASE [tempdb] MODIFY FILE ( NAME = N'$Name', SIZE = $FIleSize )
+               `n"
+               $Optimize_TempDBSize=$Optimize_TempDBSize+$tempDB_Query
+
+        }
+
+    for($i = $result_TempDBFile.Count+1; $i -le ($NoOfDataFiles-1); $i++)
+        { 
+            $LogicalName='tempdev'+$i
+            $PhysicalFile=$TempDB_FIlePath+$LogicalName+'.ndf'
+    $tempDB_Query="
+               ALTER DATABASE [tempdb] ADD FILE ( NAME = N'$LogicalName', FILENAME = N'$PhysicalFile' , SIZE = $FIleSize , FILEGROWTH = 0)
+               `n"  
+               $Optimize_TempDBSize=$Optimize_TempDBSize+$tempDB_Query
+        }
+     Write-Host "Optimize TempDB T-SQL Script to be Applied is  : $Optimize_TempDBSize" 
+
+    Invoke-Sqlcmd -ServerInstance $SQLInstance -Database master -Query $Optimize_TempDBSize
+
+}
+
+
+try
+
+    {
+    
+        $SQLInstance=Read-Host -Prompt "SQL Instance Name :"
+
+        $Instance_Id=Read-Host -Prompt "SQL Instance ID :"
+
+        $SQLInstance_Count=Read-Host -Prompt "SQL Instance Count :"
+
+        [string]$Port=Read-Host -Prompt "SQL Port Number :"
+        
+        Optimize-TempDBSize -SQLInstance $SQLInstance -Instance_Id $Instance_Id -SQLInstance_Count $SQLInstance_Count
+
+        ConfigureSQLPorts -SQLInstance $SQLInstance -Instance_Id $Instance_Id -Port $Port
+
+        ConfigSQLServices -SQLInstance $SQLInstance -Instance_Id $Instance_Id 
+
+
+
+    }
+
+catch
+
+    {
+            $ErrorMessage = $_.Exception.Message
+            $FailedItem = $_.Exception.ItemName
+            Write-Host $ErrorMessage
+            Write-Host $FailedItem
+    }
+
