@@ -1,0 +1,519 @@
+USE [DBA]
+GO
+
+/****** Object:  StoredProcedure [dbo].[rfrsh_applyrights]    Script Date: 12/29/2022 9:17:42 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/**
+
+
+IF EXISTS (SELECT * FROM sys.databases WHERE name = 'DBName' AND state_desc = 'ONLINE')
+EXEC dba.dbo.rfrsh_applyrights
+@DatabaseName = 'DBName'
+
+
+
+
+**/
+
+
+
+
+
+
+
+
+CREATE PROCEDURE [dbo].[rfrsh_applyrights] 
+	@DatabaseName nvarchar(200)
+AS
+---------------------------------------------------------------------------------
+		
+-- This procedure creates the users, rights and roles for refresh process	-
+---------------------------------------------------------------------------------
+
+DECLARE @Sqlstr						nvarchar(600)
+DECLARE @Sqlstr2					nvarchar(500)
+DECLARE @Tablenametusers			nvarchar(200)
+DECLARE @Tablenametuserstodelete	nvarchar(200)
+DECLARE @Tablenametuserstofix		nvarchar(200)
+DECLARE @Tablenametmembers			nvarchar(200)
+DECLARE @Tablenametmemberstorevoke	nvarchar(200)
+DECLARE @Tablenametpermissions		nvarchar(200)
+DECLARE @Tablenametpermissionstorevoke nvarchar(200)
+DECLARE @Tablemessages				nvarchar(200)
+DECLARE @UserID						INT
+DECLARE @ObjectName					nvarchar(100)
+DECLARE @ProtectType				nvarchar(50)
+DECLARE @Action						nvarchar(50)
+DECLARE @Grantee					nvarchar(100)
+DECLARE @Username					nvarchar(100)
+DECLARE @Owner						nvarchar(100)
+DECLARE @UserCount					INT
+DECLARE @RoleCount					INT
+DECLARE @PermissionCount			INT
+DECLARE @SchemaCount				INT
+DECLARE @RoleName					nvarchar(50)
+DECLARE @params						nvarchar(200)
+DECLARE @usertype					CHAR(1)
+DECLARE @Error						INT
+DECLARE @ErrorSave					NVARCHAR(400)
+DECLARE @Exists						INT
+DECLARE @SchemaName					nvarchar(50)
+
+--Drop and create temp tables, unmark tables from copy permission process
+SET @Tablenametusers =			'tusers'			+ @DatabaseName
+SET @Tablenametuserstodelete =	'tuserstodelete'	+ @DatabaseName
+SET @Tablenametuserstofix =		'tuserstofix'		+ @DatabaseName
+SET @Tablenametmembers =		'tmembers'			+ @DatabaseName
+SET @Tablenametmemberstorevoke = 'tmemberstorevoke' + @DatabaseName
+SET @Tablenametpermissions =	'tpermissions'		+ @DatabaseName
+SET @Tablenametpermissionstorevoke = 'tpermissionstorevoke' + @DatabaseName
+SET @Tablemessages =			'tmessages'			+ @DatabaseName
+
+SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametusers +
+				N' SET processed = 0'
+EXEC sp_executesql @Sqlstr
+
+SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametmembers +
+				N' SET processed = 0'
+EXEC sp_executesql @Sqlstr
+
+SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametpermissions +
+				N' SET processed = 0'
+EXEC sp_executesql @Sqlstr
+
+IF EXISTS (SELECT 1 FROM DBA.sys.objects WHERE name = @Tablemessages)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablemessages
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr =   N' USE DBA CREATE TABLE dbo.tmessages' + @DatabaseName + ' (	query           NVARCHAR(500),  ' +
+				N'								error 		NVARCHAR(400))'			
+EXEC sp_executesql @Sqlstr
+
+--Drop the schemas that comes with the backup file excluding object owners 
+SELECT @Sqlstr =
+N'     USE ' + @DatabaseName + ' SELECT @SchmCnt = count(*)' +
+N'     FROM sys.schemas WHERE schema_id NOT IN (SELECT schema_id FROM sys.objects)' +
+N'     AND principal_id IN (SELECT principal_id FROM  sys.database_principals WHERE is_fixed_role = 0 AND name COLLATE DATABASE_DEFAULT NOT IN (''dbo'', ''guest'',''INFORMATION_SCHEMA'', ''sys'')' +
+N'     AND type <> ''R'') AND name <> ''db_owner'''
+SELECT @params = N'@SchmCnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @SchmCnt = @SchemaCount OUTPUT
+
+WHILE(@SchemaCount > 0) 
+BEGIN
+	SELECT @Sqlstr =
+	N'     USE ' + @DatabaseName + ' SELECT TOP 1 @SchmNm = name' +
+	N'     FROM sys.schemas WHERE schema_id NOT IN (SELECT schema_id FROM sys.objects)' +
+	N'     AND principal_id IN (SELECT principal_id FROM  sys.database_principals WHERE is_fixed_role = 0 AND name COLLATE DATABASE_DEFAULT NOT IN (''dbo'', ''guest'',''INFORMATION_SCHEMA'', ''sys'')' +
+	N'     AND type <> ''R'') AND name <> ''db_owner'''
+	SELECT @params = N'@SchmNm nvarchar(50) OUTPUT' 
+	EXEC sp_executesql @Sqlstr, @params, @SchmNm = @SchemaName OUTPUT
+
+	SET @Sqlstr = 	N'  USE ' + @DatabaseName + ' DROP SCHEMA ' + QUOTENAME(@SchemaName)
+	EXEC sp_executesql @Sqlstr
+
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+		BEGIN	
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+						N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @SchemaCount = @SchemaCount - 1 
+END
+
+--Populate users to be deleted
+IF EXISTS (SELECT 1 FROM DBA.sys.objects WHERE name = @Tablenametuserstodelete)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablenametuserstodelete
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr = 	N'  USE ' + @DatabaseName + ' SELECT principal_id, name, type, 0 as processed' +
+	 	N' INTO DBA.dbo.' + @Tablenametuserstodelete +
+		N' FROM  sys.database_principals WHERE is_fixed_role = 0 AND name COLLATE DATABASE_DEFAULT NOT IN (''dbo'', ''guest'',''INFORMATION_SCHEMA'', ''sys'')' +
+		N' AND type <> ''R'' AND principal_id NOT IN (SELECT isnull(principal_id,0) FROM sys.objects)' +
+		N' AND principal_id NOT IN (SELECT principal_id FROM sys.schemas)' +
+		N' AND principal_id NOT IN (SELECT principal_id FROM sys.services)' 
+EXEC sp_executesql @Sqlstr
+
+--Delete the users that comes with the backup file excluding object owners 
+SELECT @Sqlstr =
+N'     USE DBA SELECT @ucnt = count(*)' +
+N'     FROM ' + @Tablenametuserstodelete 
+SELECT @params = N'@ucnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @ucnt = @UserCount OUTPUT
+
+WHILE(@UserCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE DBA SELECT TOP 1 @uid = principal_id, @usrnm = name FROM ' + @Tablenametuserstodelete +
+					N' WHERE processed = 0'
+	SELECT @params = N'@uid int OUTPUT, @usrnm nvarchar(100) OUTPUT' 
+	EXEC sp_executesql @Sqlstr, @params, @uid = @UserID OUTPUT, @usrnm = @Username OUTPUT
+	
+	SET @Sqlstr = N'USE ' + @DatabaseName + ' DROP USER ' +  QUOTENAME(@Username) 
+print @Sqlstr
+	EXEC sp_executesql @Sqlstr
+
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+		BEGIN	
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+						N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametuserstodelete +
+					N' SET processed = 1 WHERE principal_id = ' + CAST(@UserID AS NVARCHAR(20))
+	EXEC sp_executesql @Sqlstr
+
+	SET @UserCount = @UserCount - 1 
+END
+
+--Populate rolemembers to be revoked
+IF EXISTS (SELECT 1 FROM DBA.sys.objects WHERE name = @Tablenametmemberstorevoke)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablenametmemberstorevoke
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr = 	N' USE ' + @DatabaseName + ' SELECT USER_NAME(member_principal_id) AS username, (select name from sys.database_principals where role_principal_id = principal_id) as rolename, 0 as processed' +
+	 			N' INTO DBA.dbo.' + @Tablenametmemberstorevoke +
+				N' FROM sys.database_role_members WHERE USER_NAME(member_principal_id) NOT IN (''dbo'')'
+EXEC sp_executesql @Sqlstr
+
+--Remove rolemembers for users who owns objects, from the backup file
+SELECT @Sqlstr =
+N'     USE DBA SELECT @rlcnt = count(*)' +
+N'     FROM ' + @Tablenametmemberstorevoke 
+SELECT @params = N'@rlcnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @rlcnt = @RoleCount OUTPUT
+
+WHILE(@RoleCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE DBA SELECT TOP 1 @usrnm = username, @rlnm = rolename FROM ' + @Tablenametmemberstorevoke +
+					N' WHERE processed = 0'
+	SELECT @params = N'@usrnm nvarchar(100) OUTPUT, @rlnm nvarchar(50) OUTPUT' 
+	EXEC sp_executesql @Sqlstr, @params, @usrnm = @Username OUTPUT, @rlnm = @RoleName OUTPUT
+	
+	SET @Sqlstr = N'USE ' + @DatabaseName + ' EXEC sp_droprolemember ''' +  @RoleName + ''',''' + @Username + ''''
+	EXEC sp_executesql @Sqlstr
+
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+		BEGIN	
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+						N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametmemberstorevoke +
+					N' SET processed = 1 WHERE username = ''' + QUOTENAME(@Username) + ''' AND rolename = ''' + @RoleName + ''''
+	EXEC sp_executesql @Sqlstr
+
+	SET @RoleCount = @RoleCount - 1 
+END
+
+--Populate permissions to be revoked
+IF EXISTS (SELECT 1 FROM DBA.sys.objects WHERE name = @Tablenametpermissionstorevoke)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablenametpermissionstorevoke
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr =   N' USE DBA CREATE TABLE dbo.' + @Tablenametpermissionstorevoke + 
+		N'								(	Owner           NVARCHAR(100),  ' +
+		N'									Object 			NVARCHAR(100),	' +
+		N'									Grantee 		NVARCHAR(100),	' +
+		N'									Grantor 		NVARCHAR(100),	' +
+		N'									ProtectType 	NVARCHAR(50),  	' +
+		N'									Action			NVARCHAR(50),	' +
+		N'									Col				NVARCHAR(100),	' +
+		N'									processed		INT DEFAULT 0)	' +			
+		N' USE ' + @DatabaseName + ' INSERT INTO DBA.dbo.' + @Tablenametpermissionstorevoke + 
+		N' (Owner, Object, Grantee, Grantor, ProtectType, Action, Col)' +
+		N' EXEC sp_helprotect' 
+EXEC sp_executesql @Sqlstr
+
+--Revoke permissions for users that owns objects, from the backup file
+SELECT @Sqlstr =
+N' USE ' + @DatabaseName + ' SELECT @prmssncnt = count(*)' +
+N' FROM DBA.dbo.' + @Tablenametpermissionstorevoke +
+N' WHERE processed = 0 AND object_id(Object) IS NOT NULL'
+SELECT @params = N'@prmssncnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @prmssncnt = @PermissionCount OUTPUT
+
+WHILE(@PermissionCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE ' + @DatabaseName + ' SELECT TOP 1 @ObjctNm = Object, @Grnt = Grantee' +
+					N', @Actn = Action, @Ownr = Owner FROM DBA.dbo.' + @Tablenametpermissionstorevoke +
+					N' WHERE processed = 0 AND object_id(Object) IS NOT NULL'
+	SELECT @params =N'@ObjctNm nvarchar(100) OUTPUT, @Grnt nvarchar(100) OUTPUT, ' +
+					N'@Actn nvarchar(50) OUTPUT, @Ownr nvarchar(100) OUTPUT'
+	EXEC sp_executesql @Sqlstr, @params, 	@ObjctNm = @ObjectName OUTPUT, 
+						@Grnt = @Grantee OUTPUT,
+						@Actn = @Action OUTPUT,
+						@Ownr = @Owner OUTPUT
+
+	SET @Sqlstr = N'USE ' + @DatabaseName + ' REVOKE ' + @Action + N' ON ' + @Owner + '.' + @ObjectName + ' TO ' + @Grantee
+	EXEC sp_executesql @Sqlstr
+	
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+	BEGIN	 
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+				N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametpermissionstorevoke +
+			N' SET processed = 1 WHERE grantee = ''' + @Grantee + '''' + 
+			N' AND Object = ''' + @ObjectName + '''' +
+			N' AND Action = ''' + @Action + '''' +
+			N' AND Owner = ''' + @Owner + '''' 
+	EXEC sp_executesql @Sqlstr
+
+	SET @PermissionCount = @PermissionCount -1
+END
+
+--Fix SQL users
+IF EXISTS (SELECT 1 FROM DBA.sys.objects WHERE name = @Tablenametuserstofix)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablenametuserstofix
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr =   N' USE DBA CREATE TABLE dbo.' + @Tablenametuserstofix + 
+		N'							(	UserName    NVARCHAR(100),  ' +
+		N'								UserSID		NVARCHAR(100),	' +			
+		N'								processed	INT DEFAULT 0)	' 	
+EXEC sp_executesql @Sqlstr
+
+SET @Sqlstr =   N' USE ' + @DatabaseName + ' INSERT INTO DBA.dbo.' + @Tablenametuserstofix + 
+				N' (UserName, UserSID)' +
+				N' SELECT name, sid from sysusers' +
+				N' WHERE issqluser = 1 AND sid IS NOT NULL AND sid <> 0x0' +
+				N' AND suser_sname(sid) IS NULL ORDER BY name'
+EXEC sp_executesql @Sqlstr
+
+SELECT @Sqlstr =
+N'     USE DBA SELECT @ucnt = count(*)' +
+N'     FROM ' + @Tablenametuserstofix + ' WHERE processed = 0'
+SELECT @params = N'@ucnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @ucnt = @UserCount OUTPUT
+
+WHILE(@UserCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE DBA SELECT TOP 1 @usrnm = UserName FROM ' + @Tablenametuserstofix +
+			N' WHERE processed = 0'
+	SELECT @params = N'@usrnm nvarchar(100) OUTPUT' 
+	EXEC sp_executesql @Sqlstr, @params, @usrnm = @Username OUTPUT
+	
+	SET @Sqlstr = N'USE ' + @DatabaseName + ' EXEC sp_change_users_login ''Auto_fix'',''' +  QUOTENAME(@Username) + ''''
+print @Sqlstr
+	EXEC sp_executesql @Sqlstr
+
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+		BEGIN	
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+				N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametuserstofix +
+					N' SET processed = 1 WHERE UserName = ''' + QUOTENAME(@Username) + ''''
+print @Sqlstr
+	EXEC sp_executesql @Sqlstr
+
+	SET @UserCount = @UserCount - 1 
+END
+
+--Addusers
+SELECT @Sqlstr =
+N'     USE DBA SELECT @ucnt = count(*)' +
+N'     FROM ' + @Tablenametusers + ' WHERE processed = 0'
+SELECT @params = N'@ucnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @ucnt = @UserCount OUTPUT
+
+WHILE(@UserCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE DBA SELECT TOP 1 @uid = principal_id, @usrnm = name, @usrtyp = type FROM ' + @Tablenametusers +
+					N' WHERE processed = 0'
+	SELECT @params = N'@uid int OUTPUT, @usrnm nvarchar(100) OUTPUT, @usrtyp char(1) OUTPUT ' 
+	EXEC sp_executesql @Sqlstr, @params, @uid = @UserID OUTPUT, @usrnm = @Username OUTPUT, @usrtyp = @usertype OUTPUT
+
+	SET @Sqlstr = 	N'USE ' + @DatabaseName + ' SELECT @exsts = count(*) FROM sys.database_principals' +
+					N' WHERE name = ''' + @Username + ''''
+	SELECT @params = N'@exsts int OUTPUT ' 
+	EXEC sp_executesql @Sqlstr, @params, @exsts = @Exists OUTPUT
+
+	IF @Exists < 1 
+	BEGIN
+		IF @usertype IN ('U','G','C','K') AND LEFT(@Username, 4) <> 'HCLS-LEV\' AND LEFT(@Username, 3) <> 'HCLS-LEV\' AND LEFT(@Username, 8) <> 'BUILTIN\'
+			SET @Sqlstr = N'USE ' + @DatabaseName + ' CREATE USER ' +  '['+ @Username + ']' + ' FOR LOGIN [' + @Username + ']'
+		ELSE
+			SET @Sqlstr = N'USE ' + @DatabaseName + ' CREATE USER ' +  QUOTENAME(@Username)
+		print @Sqlstr
+		EXEC sp_executesql @Sqlstr
+
+		SELECT @Error = @@ERROR
+		IF (@Error <> 0)
+		BEGIN	
+			SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+			SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+			SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+							N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+			EXEC sp_executesql @Sqlstr2
+		END
+	END
+
+	SELECT @Sqlstr =
+	N'     USE DBA SELECT @rlcnt = count(*)' +
+	N'     FROM ' + @Tablenametmembers + 
+ 	N'     WHERE member_principal_id = ' + CAST(@UserID AS NVARCHAR(20))
+	SELECT @params = N'@rlcnt int OUTPUT ' 
+	EXEC sp_executesql @Sqlstr, @params, @rlcnt = @RoleCount OUTPUT
+
+	WHILE(@RoleCount > 0)
+	BEGIN
+		SET @Sqlstr = 	N'USE DBA SELECT TOP 1 @rlnm = rolename FROM ' + @Tablenametmembers +
+						N' WHERE processed = 0 AND member_principal_id = ' + CAST(@UserID AS NVARCHAR(20))
+		SELECT @params = N'@rlnm nvarchar(50) OUTPUT ' 
+		EXEC sp_executesql @Sqlstr, @params, @rlnm = @RoleName OUTPUT
+
+		SET @Sqlstr = N'USE ' + @DatabaseName + ' EXEC sp_addrolemember ''' +  @RoleName + ''' , ''' + @Username + ''''
+		EXEC sp_executesql @Sqlstr
+
+		SET @Error = @@ERROR
+		IF (@Error <> 0)
+		BEGIN	
+			SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error) 
+			SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+			SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+							N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+			EXEC sp_executesql @Sqlstr2
+		END
+
+		SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametmembers +
+						N' SET processed = 1 WHERE rolename = ''' + @RoleName + '''' +
+						N' AND member_principal_id = ' + CAST(@UserID AS NVARCHAR(20))
+		EXEC sp_executesql @Sqlstr
+
+		SET @RoleCount = @RoleCount -1
+	END
+ 
+	SELECT @Sqlstr =
+	N'     USE ' + @DatabaseName + ' SELECT @prmssncnt = count(*)' +
+	N'     FROM DBA..' + @Tablenametpermissions + 
+ 	N'     WHERE grantee = ''' + @Username + ''' AND object_id(Object) IS NOT NULL'
+	SELECT @params = N'@prmssncnt int OUTPUT ' 
+	EXEC sp_executesql @Sqlstr, @params, @prmssncnt = @PermissionCount OUTPUT
+
+	WHILE(@PermissionCount > 0)
+	BEGIN
+		SET @Sqlstr = 	N'USE ' + @DatabaseName + ' SELECT TOP 1 @ObjctNm = Object, @PrtctTyp = ProtectType' +
+						N', @Actn = Action, @Ownr = Owner FROM DBA..' + @Tablenametpermissions +
+						N' WHERE processed = 0 AND grantee = ''' + @Username + ''' AND object_id(Object) IS NOT NULL'
+		SELECT @params =N'@ObjctNm nvarchar(100) OUTPUT, @PrtctTyp nvarchar(50) OUTPUT, ' +
+						N'@Actn nvarchar(50) OUTPUT, @Ownr nvarchar(100) OUTPUT'
+		EXEC sp_executesql @Sqlstr, @params, 	@ObjctNm = @ObjectName OUTPUT, 
+							@PrtctTyp = @ProtectType OUTPUT,
+							@Actn = @Action OUTPUT,
+							@Ownr = @Owner OUTPUT
+
+		SET @Sqlstr = N'USE ' + @DatabaseName + ' ' + @ProtectType + ' ' + @Action + N' ON ' + @Owner + '.' + @ObjectName + ' TO ' + QUOTENAME(@Username)
+		EXEC sp_executesql @Sqlstr
+		
+		SET @Error = @@ERROR
+		IF (@Error <> 0)
+		BEGIN	 
+			SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+			SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+			SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+							N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+			EXEC sp_executesql @Sqlstr2
+		END
+
+		SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametpermissions +
+				N' SET processed = 1 WHERE grantee = ''' + @Username + '''' +
+				N' AND Object = ''' + @ObjectName + '''' +
+				N' AND ProtectType = ''' + @ProtectType + '''' +
+				N' AND Action = ''' + @Action + '''' +
+				N' AND Owner = ''' + @Owner + '''' 
+		EXEC sp_executesql @Sqlstr
+
+		SET @PermissionCount = @PermissionCount -1
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametusers +
+					N' SET processed = 1 WHERE principal_id = ' + CAST(@UserID AS NVARCHAR(20))
+	EXEC sp_executesql @Sqlstr
+
+	SET @UserCount = @UserCount - 1 
+END
+
+--Grant permissions to public
+SELECT @Sqlstr =
+N'     USE ' + @DatabaseName + ' SELECT @prmssncnt = count(*)' +
+N'     FROM DBA..' + @Tablenametpermissions + 
+N'     WHERE grantee = ''public''' + ' AND object_id(Object) IS NOT NULL'
+SELECT @params = N'@prmssncnt int OUTPUT ' 
+EXEC sp_executesql @Sqlstr, @params, @prmssncnt = @PermissionCount OUTPUT
+
+WHILE(@PermissionCount > 0)
+BEGIN
+	SET @Sqlstr = 	N'USE ' + @DatabaseName + ' SELECT TOP 1 @ObjctNm = Object, @PrtctTyp = ProtectType' +
+			N', @Actn = Action, @Ownr = Owner FROM DBA..' + @Tablenametpermissions +
+			N' WHERE processed = 0 AND grantee = ''public''' + ' AND object_id(Object) IS NOT NULL'
+	SELECT @params =N'@ObjctNm nvarchar(100) OUTPUT, @PrtctTyp nvarchar(50) OUTPUT, ' +
+			N'@Actn nvarchar(50) OUTPUT, @Ownr nvarchar(100) OUTPUT'
+	EXEC sp_executesql @Sqlstr, @params, 	@ObjctNm = @ObjectName OUTPUT, 
+						@PrtctTyp = @ProtectType OUTPUT,
+						@Actn = @Action OUTPUT,
+						@Ownr = @Owner OUTPUT
+	SET @Sqlstr = N'USE ' + @DatabaseName + ' ' + @ProtectType + ' ' + @Action + N' ON ' + @Owner + '.' + @ObjectName + ' TO public'
+	EXEC sp_executesql @Sqlstr
+	
+	SET @Error = @@ERROR
+	IF (@Error <> 0)
+	BEGIN	 
+		SET @ErrorSave = (SELECT text FROM master.sys.messages WHERE message_id = @Error)
+		SET @ErrorSave = REPLACE(@ErrorSave, '''', '"')
+		SET @Sqlstr2 = 	N'INSERT INTO DBA.dbo.' + @Tablemessages +
+						N' VALUES (''' + @Sqlstr + ''', ''' + @ErrorSave + ''')'
+		EXEC sp_executesql @Sqlstr2
+	END
+
+	SET @Sqlstr = 	N'USE DBA UPDATE ' + @Tablenametpermissions +
+			N' SET processed = 1 WHERE grantee = ''public''' +
+			N' AND Object = ''' + @ObjectName + '''' +
+			N' AND ProtectType = ''' + @ProtectType + '''' +
+			N' AND Action = ''' + @Action + '''' +
+			N' AND Owner = ''' + @Owner + '''' 
+	EXEC sp_executesql @Sqlstr
+
+	SET @PermissionCount = @PermissionCount -1
+END
+
+GO
+
+
