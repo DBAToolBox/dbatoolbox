@@ -1,0 +1,92 @@
+USE [DBName]
+GO
+
+/****** Object:  StoredProcedure [dbo].[rfrsh_copyrights]    Script Date: 12/29/2022 9:17:35 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+/**
+
+
+IF EXISTS (SELECT * FROM sys.databases WHERE name = 'DBName' AND state_desc = 'ONLINE')
+EXEC dba.dbo.rfrsh_copyrights
+@DatabaseName = 'DBName'
+
+
+
+
+**/
+
+
+
+
+
+
+
+
+
+
+
+CREATE PROCEDURE [dbo].[rfrsh_copyrights] @DatabaseName nvarchar(200)
+AS
+---------------------------------------------------------------------------------
+
+-- This procedure copies the users, rights and roles for refresh process	-
+---------------------------------------------------------------------------------
+DECLARE @Sqlstr nvarchar(800)
+DECLARE @Tablename nvarchar(200)
+
+SET @Tablename = 'tusers' + @DatabaseName
+IF EXISTS (SELECT * FROM DBA.dbo.sysobjects WHERE name = @Tablename)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablename
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Tablename = 'tpermissions' + @DatabaseName
+IF EXISTS (SELECT 1 FROM DBA.dbo.sysobjects WHERE name = @Tablename)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablename
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Tablename = 'tmembers' + @DatabaseName
+IF EXISTS (SELECT 1 FROM DBA.dbo.sysobjects WHERE name = @Tablename)
+BEGIN
+	SET @Sqlstr = 'USE DBA DROP TABLE ' +  @Tablename
+	EXEC sp_executesql @Sqlstr
+END
+
+SET @Sqlstr = 	N'  USE ' + @DatabaseName + ' SELECT principal_id, name, type, 0 as processed' +
+	 	N' INTO DBA.dbo.tusers' + @DatabaseName +
+		N' FROM  sys.database_principals WHERE is_fixed_role = 0' + 
+		N' AND name COLLATE DATABASE_DEFAULT NOT IN (''dbo'', ''guest'',''INFORMATION_SCHEMA'', ''sys'')' +
+		N' AND (name COLLATE DATABASE_DEFAULT IN (SELECT name FROM sys.server_principals WHERE is_disabled = 0 AND type <> ''R'')' + 
+		N' OR ''DomainName\'' + name COLLATE DATABASE_DEFAULT IN (SELECT name FROM sys.server_principals WHERE type in (''U'',''G'',''C'',''K'') AND is_disabled = 0))' 
+EXEC sp_executesql @Sqlstr
+
+SET @Sqlstr =   N' USE DBA CREATE TABLE dbo.tpermissions' + @DatabaseName + ' (	Owner           NVARCHAR(100),  ' +
+		N'									Object 		NVARCHAR(100),	' +
+		N'									Grantee 	NVARCHAR(100),	' +
+		N'									Grantor 	NVARCHAR(100),	' +
+		N'									ProtectType 	NVARCHAR(50),  	' +
+		N'									Action		NVARCHAR(50),	' +
+		N'									Col		NVARCHAR(100),	' +
+		N'									processed	INT DEFAULT 0)	' +			
+		N' USE ' + @DatabaseName + ' INSERT INTO DBA.dbo.tpermissions' + @DatabaseName + 
+		N' (Owner, Object, Grantee, Grantor, ProtectType, Action, Col)' +
+		N' EXEC sp_helprotect' 
+EXEC sp_executesql @Sqlstr
+
+SET @Sqlstr = 	N' USE ' + @DatabaseName + ' SELECT *, (select name from sys.database_principals where role_principal_id = principal_id) as rolename, 0 as processed ' +
+		N' INTO DBA.dbo.tmembers' + @DatabaseName + 
+		N' FROM  sys.database_role_members '
+EXEC sp_executesql @Sqlstr
+GO
+
+
