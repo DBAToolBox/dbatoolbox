@@ -1,0 +1,132 @@
+/********** Add SQL Agent Job Step1 :  STEP-1   ---  find out long running queries  *************************/
+--Script gets reporting long running query
+
+--print @sql
+if exists(select *  FROM sys.dm_exec_sessions xs 
+               JOIN sys.dm_exec_requests AS xr
+                  ON xs.session_id = xr.session_id
+               CROSS APPLY sys.dm_exec_sql_text(xr.sql_handle) AS xt
+            CROSS APPLY sys.dm_exec_query_plan(xr.plan_handle) AS xp
+               WHERE xr.Command = 'SELECT' AND XR.Session_ID>=50 AND
+                FLOOR(xr.total_elapsed_time / 1000 / 60) >= 5
+				AND  xs.login_name not in (select sp.name from sys.server_principals sp
+inner join sys.server_role_members srm on sp.principal_id=srm.member_principal_id
+where sp.type in ('u','g','s') and srm.role_principal_id=3))
+BEGIN
+declare @sql nvarchar(max)
+declare @tableHTML  NVARCHAR(MAX)
+set @sql = '
+declare @tableHTML  NVARCHAR(MAX)
+declare @profilename as varchar(100)
+select TOP 1 @profilename = name from  msdb.dbo.sysmail_profile
+SET @tableHTML =  N''<H1>Long Running Query Details </H1>''+
+              N''<table border="1">'' +
+              N''<tr><th>database_name</th><th>database_server</th><th>report_server</th>'' +
+              N''<th>program_name</th><th>login_name</th><th>query_text</th>'' +
+              N''<th>last_request_start_time_cst</th><th>total_elapsed_time_ms</th>'' +
+              N''<th>parameter_list</th>'' +
+            CAST ( ( SELECT DISTINCT td = db_name(xs.database_id), '''',
+            td = @@SERVERNAME, '''',
+            td = xs.host_name,  '''',
+            td = xs.program_name, '''',
+            td = xs.login_name, '''',
+            td = xt.text, '''',
+            td = xs.last_request_start_time, '''',
+            td = xr.total_elapsed_time, '''',
+            td = ISNULL(CAST(TRY_CONVERT(XML,SUBSTRING(CAST(xp.query_plan AS NVARCHAR(MAX)),CHARINDEX(''<ParameterList>'',CAST(xp.query_plan AS NVARCHAR(MAX))), CHARINDEX(''</ParameterList>'',CAST(xp.query_plan AS NVARCHAR(MAX))) + LEN(''</ParameterList>'') - CHARINDEX(''<ParameterList>'',CAST(xp.query_plan AS NVARCHAR(MAX))) )) AS NVARCHAR(MAX)),'''')
+            FROM sys.dm_exec_sessions xs 
+               JOIN sys.dm_exec_requests AS xr
+                  ON xs.session_id = xr.session_id
+               CROSS APPLY sys.dm_exec_sql_text(xr.sql_handle) AS xt
+            CROSS APPLY sys.dm_exec_query_plan(xr.plan_handle) AS xp
+               WHERE xr.Command = ''SELECT'' AND XR.Session_ID>=50 AND
+                FLOOR(xr.total_elapsed_time / 1000 / 60) >= 5
+				AND  xs.login_name not in (select sp.name from sys.server_principals sp
+inner join sys.server_role_members srm on sp.principal_id=srm.member_principal_id
+where sp.type in (''u'',''g'',''s'') and srm.role_principal_id=3)
+               FOR XML PATH(''tr''), TYPE ) AS NVARCHAR(MAX)) +
+            N''</table>'';
+EXEC msdb.dbo.sp_send_dbmail
+@profile_name = @profilename,
+@recipients = ''email1@email.com;email2@email.com'',
+--@query = '''',
+@subject = ''Long Running Query Details''--,
+--@exclude_query_output = 1,
+--@attach_query_result_as_file = 1;
+,@body = @tableHTML
+,@body_format = ''HTML'' ;'
+EXEC sp_executesql @sql;
+END
+
+
+/************ add new step in SQL Agent Job :  STEP-2  :  Kill Long running queries  *************/
+
+
+SET NOCOUNT ON; 
+SET deadlock_priority low; 
+DECLARE   @min_long_running_minutes AS INT
+DECLARE @sqlcmd VARCHAR(max); 
+DECLARE @debug BIT=0; -- 1=print out kill command, 0=execute kill command  
+DECLARE @i INT
+SET @min_long_running_minutes = 5
+SET @debug = 0; -- 1=print, 0=exec  
+SET @sqlcmd=''; 
+
+SELECT @i = COUNT(xs.session_id)
+FROM sys.dm_exec_sessions xs 
+   JOIN sys.dm_exec_requests AS xr
+      ON xs.session_id = xr.session_id
+   CROSS APPLY sys.dm_exec_sql_text(xr.sql_handle) AS xt
+   WHERE  FLOOR(xr.total_elapsed_time / 1000 / 60) >= @min_long_running_minutes
+          AND XR.Command='SELECT' AND XR.Session_ID>50 AND XS.Login_Name NOT IN (SELECT sp.name
+from sys.server_principals sp inner join sys.server_role_members srm on sp.principal_id=srm.member_principal_id
+where sp.type in ('u','g','s'))
+WHILE @i > 0 
+  BEGIN 
+     ;WITH cte (session_id, login_name, status, total_elapsed_time_min, is_long_running) 
+      AS (SELECT xr.session_id, 
+            xs.login_name,
+            xr.status,
+            FLOOR(xr.total_elapsed_time / 1000 / 60) AS total_elapsed_time_min,
+            CASE 
+            WHEN  FLOOR(xr.total_elapsed_time / 1000 / 60) >= @min_long_running_minutes THEN 1
+            ELSE 0
+            END AS is_long_running
+         FROM sys.dm_exec_sessions xs 
+   JOIN sys.dm_exec_requests AS xr
+      ON xs.session_id = xr.session_id
+   CROSS APPLY sys.dm_exec_sql_text(xr.sql_handle) AS xt
+   WHERE  FLOOR(xr.total_elapsed_time / 1000 / 60) >= @min_long_running_minutes
+          AND XR.Command='SELECT' AND XR.Session_ID>50 AND XS.Login_Name NOT IN (SELECT sp.name
+from sys.server_principals sp inner join sys.server_role_members srm on sp.principal_id=srm.member_principal_id
+where sp.type in ('u','g','s'))
+            )
+      SELECT DISTINCT @sqlcmd = @sqlcmd + 'kill ' 
+         + Cast(cte.session_id AS VARCHAR) + ';' 
+         + Char(0x0d) + Char(0x0a) 
+         FROM   cte
+         WHERE cte.session_id > 50
+         AND cte.session_id <> @@spid
+       --where long running query is not system or current spid
+          IF @debug = 1
+            PRINT @sqlcmd; 
+           ELSE 
+          EXEC (@sqlcmd); 
+        --wait 5 seconds and check if there is additional long running queries
+        WAITFOR delay '00:00:5.000' 
+            SELECT @i = COUNT(xs.session_id)
+            FROM sys.dm_exec_sessions xs 
+   JOIN sys.dm_exec_requests AS xr
+      ON xs.session_id = xr.session_id
+   CROSS APPLY sys.dm_exec_sql_text(xr.sql_handle) AS xt
+   WHERE  FLOOR(xr.total_elapsed_time / 1000 / 60) >= @min_long_running_minutes
+          AND XR.Command='SELECT' AND XR.Session_ID>50 AND XS.Login_Name NOT IN (SELECT sp.name
+from sys.server_principals sp inner join sys.server_role_members srm on sp.principal_id=srm.member_principal_id
+where sp.type in ('u','g','s'))
+        --reset kill command 
+        SET @sqlcmd=''; 
+  END
+
+
+
+
