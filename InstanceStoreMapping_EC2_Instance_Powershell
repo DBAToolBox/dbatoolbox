@@ -1,0 +1,105 @@
+$ErrorActionPreference="SilentlyContinue"
+
+
+if (!(Get-Volume|Where-Object {$_.DriveLetter -eq 'Z'})) 
+    
+    {
+        
+        #Create pool and virtual disk for TempDB using mirroring with NVMe
+        $NVMe = Get-PhysicalDisk | ? { $_.CanPool -eq $True -and $_.FriendlyName -eq "NVMe Amazon EC2 NVMe"}
+        New-StoragePool -FriendlyName TempDBPool -StorageSubsystemFriendlyName "Windows Storage*" -PhysicalDisks $NVMe
+        New-VirtualDisk -StoragePoolFriendlyName TempDBPool -FriendlyName TempDBDisk -ResiliencySettingName simple -ProvisioningType Fixed -UseMaximumSize
+        Get-VirtualDisk -FriendlyName TempDBDisk | Get-Disk | Initialize-Disk -Passthru | New-Partition -DriveLetter Z -UseMaximumSize | Format-Volume -FileSystem ReFS -AllocationUnitSize 65536 -NewFileSystemLabel SQL_TempDB -Confirm:$false
+        
+               
+         #grant SQL Server Startup account full access to the new drive
+        $item = gi -literalpath "Z:\"
+        $serviceaccount = "Domain\SvcAccount"  ##replace service account name
+        $acl = $item.GetAccessControl()
+        #$permission="NT SERVICE\MSSQLSERVER","FullControl","Allow"
+        $permission= $serviceaccount, "FullControl","ContainerInherit, ObjectInherit","None","Allow"
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule $permission
+        $acl.SetAccessRule($rule)
+        $item.SetAccessControl($acl)
+        
+   }
+
+    #create Folder Structure
+        New-Item -Path Z:\InstanceNameFolder\MSSQL\TempDB -ItemType Directory -Force
+        New-Item -Path Z:\InstanceNameFolder\MSSQL\TempDBLog -ItemType Directory -Force
+
+$max_retry=5
+
+$SQLInstanceList=@('InstanceName')   ## replace instancename with your instancename
+
+foreach($Instance in $SQLInstanceList)
+
+    {
+
+        $SqlServer='MSSQL$'+$Instance
+
+        $ServiceStatus=$null
+
+        $count=0
+
+        $ServiceStatus=Get-Service -Name $SqlServer 
+
+        if($ServiceStatus.Status -ne 'running')
+
+            {
+
+                do
+
+                    {
+
+                        $count=$count+1
+
+                        Start-Service -Name $SqlServer -PassThru
+
+                        Start-Sleep -Seconds 5
+
+                        Get-Service -Name $SqlServer 
+
+
+
+                    } 
+            
+                    while((Get-Service -Name $SqlServer |Where-Object {$_.Status -ne 'running' -and $_.StartType -eq 'Automatic'}) -and $count -le $max_retry)
+
+            }
+
+
+        $SqlAgent='SQLAGENT$'+$Instance
+
+        $Agent_ServiceStatus=$null
+
+        $count=0
+
+        $Agent_ServiceStatus=Get-Service -Name $SqlAgent 
+
+        if($Agent_ServiceStatus.Status -ne 'running')
+
+            {
+
+                do
+
+                    {
+
+                        $count=$count+1
+
+                        Start-Service -Name $SqlAgent -PassThru
+
+                        Start-Sleep -Seconds 5
+
+                        Get-Service -Name $SqlAgent 
+
+
+
+                    } 
+            
+                    while((Get-Service -Name $SqlAgent |Where-Object {$_.Status -ne 'running' -and $_.StartType -eq 'Automatic'}) -and $count -le $max_retry)
+
+            }
+    }
+
+
