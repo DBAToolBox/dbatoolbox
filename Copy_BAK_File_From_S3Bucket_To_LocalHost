@@ -1,0 +1,83 @@
+
+## Copy .BAK file from S# bucket to server disk for specific backup date
+
+Set-Location -Path 'C:\Program Files\Amazon\AWSCLIV2'
+
+New-Item -ItemType DIrectory -Path V:\targetFolderName\ -Name Parallel_Testing -Force
+
+#region Init1
+
+    $s3_Path=$null
+
+    $Count=$null
+
+    $s3_Path="s3://bucketName/"
+
+    $Primary_Date="2023-02-15/" 
+    
+    $fullPath=$s3_Path+$Primary_Date
+
+    [string]$Count=.\aws.exe s3 ls $fullPath
+
+    $Count   
+    
+#endregion
+
+#region region_1
+
+if($Count.Length -gt 0)
+
+    {
+
+        .\aws.exe s3 cp $fullPath "V:\targetFolderName\Parallel_Testing\" --include "*_full_*.BAK" --exclude "*_tlog_*.BAK" --recursive
+        .\aws.exe s3 cp $fullPath "V:\targetFolderName\Parallel_Testing\" --include "*_diff_*.BAK" --exclude "*_tlog_*.BAK" --recursive
+
+    }
+else
+
+    {
+
+        Write-Output "No Records Found"
+        
+    }
+
+#endregion
+
+#region Init2
+
+    $s3_Path=$null
+
+    $Count=$null
+
+    $s3_Path="s3://bucketName/"
+
+    $Primary_Date="2023-02-16/"  
+    
+    $fullPath=$s3_Path+$Primary_Date
+
+    [string]$Count=.\aws.exe s3 ls $fullPath
+
+    $Count   
+    
+#endregion
+
+#region region_2
+
+if($Count.Length -gt 0)
+
+    {
+
+        .\aws.exe s3 cp $fullPath "V:\targetFolderName\Parallel_Testing\" --include "*_full_*.BAK" --exclude "*_tlog_*.BAK" --recursive
+        .\aws.exe s3 cp $fullPath "V:\targetFolderName\Parallel_Testing\" --include "*_diff_*.BAK" --exclude "*_tlog_*.BAK" --recursive
+
+    }
+else
+
+    {
+
+        Write-Output "No Records Found"
+        
+    }
+
+#endregion
+
