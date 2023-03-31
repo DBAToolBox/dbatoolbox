@@ -1,0 +1,6 @@
+
+Create Folder name same as instance name
+
+make sure you have RetainDBPermissions.txt in folder as mentioned in -i parameter
+
+--sp_msforeachdb'xp_cmdshell ''sqlcmd -S YOURSERVERNAME -d ? -i "D:\Adhish\ScriptOutDBPermissions\RetainDBPermissions.txt" -o "d:\YOUROUTPUTPATH\?_perms_YOURSERVERNAME.sql"'''
